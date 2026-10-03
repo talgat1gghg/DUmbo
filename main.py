@@ -6,29 +6,32 @@ import numpy as np
 import json
 import ollama
 
-SYSTEM_PROMPT = """You are an autonomous camera operator for an ESP32-CAM.
-Your task is to aim the camera at the target requested by the user.
+SYSTEM_PROMPT = """You are an autonomous camera operator on an ESP32-CAM.
+Your job is to execute multi-step movement commands or search tasks.
 
-Camera Setup:
-- Channel 0: . Range: 0 (down), to 120 (up). Default: 90.
-- Channel 1: . Range: 0 (backward), to 120 (forward). Default: 90.
+Camera Specs:
+- Channel 1:. Range: 20 (forward) to 120 (backward). Default: 90.
+- Channel 0: Vertical (Tilt). Range: 20 (Down) to 120 (Up). Default: 90.
 
 RESPONSE FORMAT RULES:
-You MUST ALWAYS reply in strict JSON format with ONLY these two keys:
-1. "message": A short explanation of what you see and what action you are taking.
-2. "angles": An object with "channel_0" and "channel_1" integer values (0-180). 
-   If no movement is needed, return the current angles.
+You MUST reply in strict JSON format with these exact keys:
+1. "message": Reason for the current action or progress update.
+2. "angles": An object with "channel_0" and "channel_1" targets (0-180).
+3. "status": String, either "continue" or "complete".
+   - Use "continue" if the task requires another step (e.g., target not found yet, or moving to the next position in a multi-step command).
+   - Use "complete" if the target is found, the sequence is finished, or no further movement is possible.
 
 JSON Example:
 {
-  "message": "I see the object on the left. Rotating left to center it.",
+  "message": "Scanning to the right, target object not seen yet.",
   "angles": {
-    "channel_0": 45,
+    "channel_0": 120,
     "channel_1": 90
-  }
+  },
+  "status": "continue"
 }"""
 
-ESP_IP = "your_esp32_ip_here"  # Replace with your ESP32-CAM IP address
+ESP_IP = "192.168.1.113"  # Replace with your ESP32-CAM IP address
 URL_SERVO = f"http://{ESP_IP}/servo"
 URL_SNAPSHOT = f"http://{ESP_IP}/capture"
 
@@ -60,69 +63,94 @@ def capture_photo():
         print(f"[Camera Error]: {e}")
     return None
 
-def process_command(user_request):
+def run_multi_step_command(user_request, max_steps=5):
     print(f"\n=== Command: {user_request} ===")
-    
-    photo_path = capture_photo()
-    if not photo_path:
-        print("error: unable to capture photo.")
-        return
 
-    # send the current angles to the model
-    user_prompt = (
-        f"User request: '{user_request}'.\n"
-        f"Current camera position: Channel 0 = {current_angles[0]}°, Channel 1 = {current_angles[1]}°.\n"
-        f"Analyze the attached image and reply in JSON."
-    )
-    print(user_prompt)
-    try:
-        # request format='json'
-        response = ollama.chat(
-            model='gemma3:4b', #can be changed to any other model, but needs to have vision capabilities
-            format='json',     
-            messages=[
-                {'role': 'system', 'content': SYSTEM_PROMPT},
-                {'role': 'user', 'content': user_prompt, 'images': [photo_path]}
-            ]
+    step_history = [] # to keep track of previous steps and angles
+
+    for step in range(1, max_steps + 1):
+        print(f"\n--- Step {step}/{max_steps} ---")
+    
+        photo_path = capture_photo()
+        if not photo_path:
+            print("error: unable to capture photo.")
+            return
+        
+        #giving the model the last 3 steps of history for context
+        history_text = "\n".join(step_history[-3:])# keep last 3 steps in history
+    
+        # send the current angles to the model
+        user_prompt = (
+            f"Original Goal: '{user_request}'\n"
+            f"Current Angles: Channel 0 = {current_angles[0]}°, Channel 1 = {current_angles[1]}°.\n"
+            f"Recent history:\n{history_text}\n"
+            f"Analyze the image, update angles if needed, and set status to 'continue' or 'complete'."
         )
 
-        # get text
-        raw_text = response['message']['content']
-        data = json.loads(raw_text)
+        print(user_prompt)
 
-        print(f"\n[AI Response]: {data.get('message')}")
-        
-        # parse angles
-        new_angles = data.get('angles', {})
-        target_ch0 = new_angles.get('channel_0', current_angles[0])
-        target_ch1 = new_angles.get('channel_1', current_angles[1])
+        try:
+            # request format='json'
+            response = ollama.chat(
+                model='gemma3:4b', #can be changed to any other model, but needs to have vision capabilities
+                format='json',     
+                messages=[
+                    {'role': 'system', 'content': SYSTEM_PROMPT},
+                    {'role': 'user', 'content': user_prompt, 'images': [photo_path]}
+                ]
+            )
 
-        # if angles are different, move the camera
-        moved = False
-        if target_ch0 != current_angles[0]:
-            print(f"[Movement] Channel 0: {current_angles[0]}° -> {target_ch0}°")
-            set_camera_angle(0, target_ch0)
-            moved = True
+            # get text
+            raw_text = response['message']['content']
+            data = json.loads(raw_text)
 
-        if target_ch1 != current_angles[1]:
-            print(f"[Movement] Channel 1: {current_angles[1]}° -> {target_ch1}°")
-            set_camera_angle(1, target_ch1)
-            moved = True
+            print(f"\n[AI Response]: {data.get('message')}")
+            
+            # parse angles
+            status = data.get("status", "complete").lower()
+            new_angles = data.get('angles', {})
+            target_ch0 = new_angles.get('channel_0', current_angles[0])
+            target_ch1 = new_angles.get('channel_1', current_angles[1])
 
-        if moved:
-            print("[Success] Camera moved to new position.")
-        else:
-            print("[info] No movement required.")
+            print(f"[STATUS]: {status}")
 
-    except json.JSONDecodeError:
-        print(f"[error JSON]: unable to parse the answer from AI: {raw_text}")
-    except Exception as e:
-        print(f"[error]: {e}")
+            #remebering the step history for context in the next step
+            step_history.append(f"Step {step}: moved to (Ch0:{target_ch0}, Ch1:{target_ch1}), status:{status}")
+
+            # if the status is complete we break the loop
+            if status == "complete":
+                print("\n[Success] AI reached the goal")
+                break
+
+            # if angles are different, move the camera
+            moved = False
+            if target_ch0 != current_angles[0]:
+                print(f"[Movement] Channel 0: {current_angles[0]}° -> {target_ch0}°")
+                set_camera_angle(0, target_ch0)
+                moved = True
+
+            if target_ch1 != current_angles[1]:
+                print(f"[Movement] Channel 1: {current_angles[1]}° -> {target_ch1}°")
+                set_camera_angle(1, target_ch1)
+                moved = True
+
+            if moved:
+                print("[Success] Camera moved to new position.")
+            else:
+                print("[info] No movement required.")
+
+        except json.JSONDecodeError:
+            print(f"[error JSON]: unable to parse the answer from AI: {raw_text}")
+        except Exception as e:
+            print(f"[error]: {e}")
+
+    else:
+        print("\n[info] Maximum steps reached.")
 
 if __name__ == "__main__":
     while True:
         cmd = input("\ncommand (or 'exit'): ").strip()
         if cmd.lower() in ['exit', 'quit']:
             break
-        process_command(cmd)
+        run_multi_step_command(cmd)
         
